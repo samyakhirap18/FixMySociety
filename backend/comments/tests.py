@@ -1,0 +1,365 @@
+"""
+Tests for comments app.
+"""
+import pytest
+from rest_framework import status
+from rest_framework.test import APIClient
+from rest_framework_simplejwt.tokens import RefreshToken
+
+from issues.models import Issue
+from projects.models import Project
+
+from .models import Comment
+
+
+@pytest.mark.django_db
+class TestCommentEndpoints:
+    """
+    Test comment endpoints.
+    """
+
+    @pytest.fixture
+    def issue(self, user):
+        """
+        Create a test issue.
+        """
+        project = Project.objects.create(
+            name='Test Project',
+            description='A test project',
+            created_by=user
+        )
+        return Issue.objects.create(
+            title='Test Issue',
+            description='A test issue',
+            project=project,
+            reporter=user
+        )
+
+    def test_create_comment(self, authenticated_client, issue):
+        """
+        Test creating a comment.
+        """
+        api_client, user = authenticated_client
+        data = {
+            'content': 'This is a test comment',
+            'issue': issue.id,
+        }
+        response = api_client.post('/api/comments/', data)
+        assert response.status_code == status.HTTP_201_CREATED
+        assert Comment.objects.filter(content='This is a test comment').exists()
+
+    def test_list_comments(self, authenticated_client, issue, user):
+        """
+        Test listing comments.
+        """
+        api_client, _ = authenticated_client
+        Comment.objects.create(
+            content='Test comment',
+            issue=issue,
+            author=user
+        )
+        response = api_client.get('/api/comments/')
+        assert response.status_code == status.HTTP_200_OK
+        assert response.data['count'] >= 1
+        assert any(item['content'] == 'Test comment' for item in response.data['results'])
+
+    def test_retrieve_comment(self, authenticated_client, issue, user):
+        """
+        Test retrieving a specific comment.
+        """
+        api_client, _ = authenticated_client
+        comment = Comment.objects.create(
+            content='Test comment',
+            issue=issue,
+            author=user
+        )
+        response = api_client.get(f'/api/comments/{comment.id}/')
+        assert response.status_code == status.HTTP_200_OK
+        assert response.data['content'] == 'Test comment'
+
+    def test_update_comment(self, authenticated_client, issue, user):
+        """
+        Test updating a comment.
+        """
+        api_client, _ = authenticated_client
+        comment = Comment.objects.create(
+            content='Test comment',
+            issue=issue,
+            author=user
+        )
+        data = {'content': 'Updated comment'}
+        response = api_client.patch(f'/api/comments/{comment.id}/', data)
+        assert response.status_code == status.HTTP_200_OK
+        comment.refresh_from_db()
+        assert comment.content == 'Updated comment'
+
+    def test_delete_comment(self, authenticated_client, issue, user):
+        """
+        Test deleting a comment.
+        """
+        api_client, _ = authenticated_client
+        comment = Comment.objects.create(
+            content='Test comment',
+            issue=issue,
+            author=user
+        )
+        response = api_client.delete(f'/api/comments/{comment.id}/')
+        assert response.status_code == status.HTTP_204_NO_CONTENT
+        assert not Comment.objects.filter(id=comment.id).exists()
+
+    def test_create_comment_for_issue(self, authenticated_client, issue):
+        """
+        Test creating a comment for a specific issue via standard endpoint.
+        """
+        api_client, user = authenticated_client
+        data = {
+            'content': 'Issue-specific comment',
+            'issue': issue.id,
+        }
+        response = api_client.post('/api/comments/', data)
+        assert response.status_code == status.HTTP_201_CREATED
+        assert Comment.objects.filter(content='Issue-specific comment', issue=issue).exists()
+
+    def test_list_comments_by_issue(self, authenticated_client, issue, user):
+        """
+        Test listing comments filtered by issue.
+        """
+        api_client, _ = authenticated_client
+        Comment.objects.create(
+            content='Comment 1',
+            issue=issue,
+            author=user
+        )
+        Comment.objects.create(
+            content='Comment 2',
+            issue=issue,
+            author=user
+        )
+        response = api_client.get(f'/api/comments/?issue_id={issue.id}')
+        assert response.status_code == status.HTTP_200_OK
+        assert response.data['count'] == 2
+        assert [item['content'] for item in response.data['results']] == ['Comment 1', 'Comment 2']
+
+    def test_create_comment_unauthenticated(self, api_client, issue):
+        """
+        Test creating a comment without authentication.
+        """
+        data = {
+            'content': 'Test comment',
+            'issue': issue.id,
+        }
+        response = api_client.post('/api/comments/', data)
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+    def test_comment_author_set_automatically(self, authenticated_client, issue):
+        """
+        Test that comment author is set to current user automatically.
+        """
+        api_client, user = authenticated_client
+        data = {
+            'content': 'Test comment',
+            'issue': issue.id,
+        }
+        response = api_client.post('/api/comments/', data)
+        assert response.status_code == status.HTTP_201_CREATED
+        comment = Comment.objects.get(content='Test comment')
+        assert comment.author == user
+
+    def test_create_for_issue_sets_author(self, authenticated_client, issue, another_user):
+        """
+        The issue shortcut stores the comment on that issue as the caller.
+        """
+        api_client, user = authenticated_client
+        response = api_client.post(
+            f'/api/comments/create-for-issue/{issue.id}/',
+            {'content': 'Shortcut comment', 'author': another_user.id},
+        )
+        assert response.status_code == status.HTTP_201_CREATED
+        comment = Comment.objects.get(content='Shortcut comment')
+        assert comment.author == user
+        assert comment.issue == issue
+        assert response.data['author_email'] == user.email
+        assert response.data['author_name'] == user.get_full_name()
+
+    def test_create_for_issue_rejects_blank_content(self, authenticated_client, issue):
+        """
+        The issue shortcut still requires comment content.
+        """
+        api_client, _ = authenticated_client
+        response = api_client.post(f'/api/comments/create-for-issue/{issue.id}/', {'content': ''})
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert issue.comments.count() == 0
+
+    def test_create_for_missing_issue(self, authenticated_client):
+        """
+        Commenting on a missing issue returns 404.
+        """
+        api_client, _ = authenticated_client
+        response = api_client.post(
+            '/api/comments/create-for-issue/99999/',
+            {'content': 'Nowhere'},
+        )
+        assert response.status_code == status.HTTP_404_NOT_FOUND
+        assert response.data['error'] == 'Not Found'
+
+    def test_empty_comment_rejected(self, authenticated_client, issue):
+        """
+        A comment needs content.
+        """
+        api_client, _ = authenticated_client
+        response = api_client.post('/api/comments/', {'content': '', 'issue': issue.id})
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert not Comment.objects.filter(issue=issue, content='').exists()
+
+    def test_comment_string(self, comment):
+        """
+        A comment names its author and issue.
+        """
+        assert str(comment.issue) in str(comment)
+        assert 'Comment by' in str(comment)
+
+    def test_stranger_cannot_edit_or_delete_comment(
+        self, authenticated_client_other, issue, user
+    ):
+        """
+        Only the author can change a comment.
+        """
+        api_client, _other = authenticated_client_other
+        comment = Comment.objects.create(content='Original', issue=issue, author=user)
+        update = api_client.patch(f'/api/comments/{comment.id}/', {'content': 'Hijacked'})
+        remove = api_client.delete(f'/api/comments/{comment.id}/')
+        assert update.status_code == status.HTTP_403_FORBIDDEN
+        assert update.data['error'] == 'Forbidden'
+        assert remove.status_code == status.HTTP_403_FORBIDDEN
+        comment.refresh_from_db()
+        assert comment.content == 'Original'
+
+    def test_whitespace_comment_rejected(self, authenticated_client, issue):
+        """
+        A comment that is only whitespace is rejected.
+        """
+        api_client, _user = authenticated_client
+        response = api_client.post('/api/comments/', {'content': '   ', 'issue': issue.id})
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert issue.comments.count() == 0
+
+    def test_oversized_comment_rejected(self, authenticated_client, issue):
+        """
+        Comment text has an upper bound.
+        """
+        api_client, _user = authenticated_client
+        response = api_client.post('/api/comments/', {
+            'content': 'a' * 5001,
+            'issue': issue.id,
+        })
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert issue.comments.count() == 0
+
+    def test_invalid_issue_filter_is_400(self, authenticated_client):
+        """
+        A non-numeric issue filter does not raise a server error.
+        """
+        api_client, _user = authenticated_client
+        response = api_client.get('/api/comments/?issue_id=nope')
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+    def test_create_for_issue_rejects_non_numeric_id(self, authenticated_client):
+        """
+        The issue shortcut rejects a non-numeric issue id.
+        """
+        api_client, _user = authenticated_client
+        response = api_client.post(
+            '/api/comments/create-for-issue/abc/',
+            {'content': 'Nowhere'},
+        )
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert not Comment.objects.filter(content='Nowhere').exists()
+
+    def test_invalid_comment_lookup_is_400(self, authenticated_client):
+        """
+        A non-numeric comment id is a client error.
+        """
+        api_client, _user = authenticated_client
+        response = api_client.get('/api/comments/abc/')
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+    def test_deleted_author_serializes(self, authenticated_client, issue, user, another_user):
+        """
+        A comment remains readable after its author is deleted.
+        """
+        comment = Comment.objects.create(content='Still here', issue=issue, author=user)
+        user.delete()
+        comment.refresh_from_db()
+        client = APIClient()
+        refresh = RefreshToken.for_user(another_user)
+        client.credentials(HTTP_AUTHORIZATION=f'Bearer {refresh.access_token}')
+        response = client.get(f'/api/comments/{comment.id}/')
+        assert response.status_code == status.HTTP_200_OK
+        assert response.data['author'] is None
+        assert response.data['author_name'] is None
+        assert response.data['author_email'] is None
+        assert response.data['content'] == 'Still here'
+        assert 'deleted user' in str(comment)
+
+    def test_comment_cannot_be_moved_to_another_issue(self, authenticated_client, issue, user):
+        """Editing a comment does not attach it to a different issue."""
+        api_client, _user = authenticated_client
+        comment = Comment.objects.create(content='Original', issue=issue, author=user)
+        other = Issue.objects.create(
+            title='Other issue',
+            description='A second thread',
+            project=issue.project,
+            reporter=user,
+        )
+        response = api_client.patch(f'/api/comments/{comment.id}/', {
+            'issue': other.id,
+            'content': 'Edited',
+        })
+        assert response.status_code == status.HTTP_200_OK
+        comment.refresh_from_db()
+        assert comment.issue_id == issue.id
+        assert comment.content == 'Edited'
+
+    def test_project_owner_can_delete_someone_elses_comment(
+        self, authenticated_client, issue, another_user
+    ):
+        """The project owner can remove a comment they did not write."""
+        api_client, _owner = authenticated_client
+        comment = Comment.objects.create(content='Spam', issue=issue, author=another_user)
+        response = api_client.delete(f'/api/comments/{comment.id}/')
+        assert response.status_code == status.HTTP_204_NO_CONTENT
+        assert not Comment.objects.filter(id=comment.id).exists()
+
+    def test_author_email_is_hidden_from_unrelated_users(
+        self, authenticated_client, authenticated_client_other, issue, another_user
+    ):
+        """Only the author, project owner, or staff receive the comment author's email."""
+        comment = Comment.objects.create(
+            content='Private address',
+            issue=issue,
+            author=another_user,
+        )
+
+        owner_client, _owner = authenticated_client
+        owner_response = owner_client.get(f'/api/comments/{comment.id}/')
+        assert owner_response.status_code == status.HTTP_200_OK
+        assert owner_response.data['author_email'] == another_user.email
+
+        other_client, _other = authenticated_client_other
+        author_response = other_client.get(f'/api/comments/{comment.id}/')
+        assert author_response.data['author_email'] == another_user.email
+
+        from django.contrib.auth import get_user_model
+        stranger = get_user_model().objects.create_user(
+            email='stranger@example.com',
+            username='stranger',
+            password='testpass123',
+        )
+        stranger_client = APIClient()
+        refresh = RefreshToken.for_user(stranger)
+        stranger_client.credentials(HTTP_AUTHORIZATION=f'Bearer {refresh.access_token}')
+        hidden = stranger_client.get(f'/api/comments/{comment.id}/')
+        assert hidden.status_code == status.HTTP_200_OK
+        assert hidden.data['author_name'] == another_user.get_full_name()
+        assert hidden.data['author_email'] is None
+        assert hidden.data['content'] == 'Private address'
